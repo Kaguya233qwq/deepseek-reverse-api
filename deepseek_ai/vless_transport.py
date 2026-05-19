@@ -122,7 +122,7 @@ class VlessTransport:
         """
         from deepseek_ai.vless_proxy import VlessURI
 
-        self.config = VlessURI(uri)
+        self.config: VlessURI = VlessURI(uri)
         self._socket: Optional[socket.socket] = None
         self._ssl_socket: Optional[ssl.SSLSocket] = None
 
@@ -201,7 +201,7 @@ class VlessTransport:
         target_host: str,
         target_port: int,
         path: str = "/",
-        host: str | None = None,
+        host: Optional[str] = None,
         timeout: float = 30,
     ) -> socket.socket:
         """
@@ -241,7 +241,7 @@ class VlessTransport:
 
         return sock
 
-    def close(self):
+    def close(self) -> None:
         """关闭连接"""
         if self._ssl_socket:
             self._ssl_socket.close()
@@ -269,7 +269,7 @@ class AsyncVlessTransport:
         """
         from deepseek_ai.vless_proxy import VlessURI
 
-        self.config = VlessURI(uri)
+        self.config: VlessURI = VlessURI(uri)
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._transport = None
@@ -360,7 +360,7 @@ class AsyncVlessTransport:
         target_host: str,
         target_port: int,
         path: str = "/",
-        host: str = None,
+        host: Optional[str] = None,
         timeout: float = 30,
     ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """
@@ -403,7 +403,7 @@ class AsyncVlessTransport:
 
         return reader, writer
 
-    async def close(self):
+    async def close(self) -> None:
         """关闭连接"""
         if self._writer:
             self._writer.close()

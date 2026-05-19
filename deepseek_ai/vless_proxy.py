@@ -9,7 +9,7 @@ import ssl
 import asyncio
 import random
 import os
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import parse_qs
 import logging
 
@@ -20,7 +20,7 @@ class VlessURI:
     """解析 Vless URI"""
     
     def __init__(self, uri: str):
-        self.uri = uri
+        self.uri: str = uri
         self.uuid: str = ""
         self.address: Optional[str] = None
         self.port: Optional[int] = None
@@ -37,7 +37,7 @@ class VlessURI:
         self.spx: Optional[str] = None
         self._parse()
     
-    def _parse(self):
+    def _parse(self) -> None:
         """解析 Vless URI"""
         try:
             # vless://uuid@address:port?params#remark
@@ -106,7 +106,7 @@ class VlessURI:
         except Exception as e:
             raise ValueError(f'Failed to parse Vless URI: {e}')
     
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"VlessURI({self.address}:{self.port}, network={self.network}, tls={self.tls})"
 
 
@@ -131,11 +131,11 @@ class VlessProxy:
         Args:
             uri: Vless URI，格式: vless://uuid@address:port?params#remark
         """
-        self.config = VlessURI(uri)
-        self._lock = asyncio.Lock()
-        self._last_used = 0
-        self._fail_count = 0
-        self._healthy = True
+        self.config: VlessURI = VlessURI(uri)
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._last_used: float = 0
+        self._fail_count: int = 0
+        self._healthy: bool = True
     
     @property
     def is_healthy(self) -> bool:
@@ -147,13 +147,13 @@ class VlessProxy:
         """获取代理标识符"""
         return f"{self.config.address}:{self.config.port}"
     
-    def mark_success(self):
+    def mark_success(self) -> None:
         """标记请求成功"""
         self._fail_count = 0
         self._healthy = True
         self._last_used = asyncio.get_event_loop().time()
     
-    def mark_fail(self):
+    def mark_fail(self) -> None:
         """标记请求失败"""
         self._fail_count += 1
         if self._fail_count >= 3:
@@ -322,9 +322,9 @@ class VlessProxyPool:
     """Vless 代理池 - 管理多个 Vless 代理"""
     
     def __init__(self):
-        self._proxies: list = []
-        self._current_index = 0
-        self._lock = asyncio.Lock()
+        self._proxies: List[VlessProxy] = []
+        self._current_index: int = 0
+        self._lock: asyncio.Lock = asyncio.Lock()
     
     def add_proxy(self, uri: str) -> bool:
         """
@@ -345,7 +345,7 @@ class VlessProxyPool:
             logger.error(f'Failed to add Vless proxy: {e}')
             return False
     
-    def add_proxies_from_uris(self, uris: list) -> Tuple[int, int]:
+    def add_proxies_from_uris(self, uris: List[str]) -> Tuple[int, int]:
         """
         从多个 URI 添加代理
         
@@ -456,11 +456,11 @@ class VlessProxyPool:
         Returns:
             代理标识符到测试结果的映射
         """
-        results = {}
-        tasks = []
+        results: Dict[str, bool] = {}
+        tasks: List[Tuple[str, asyncio.Task]] = []
         
         for proxy in self._proxies:
-            task = proxy.test_connection(target_host, target_port)
+            task = asyncio.create_task(proxy.test_connection(target_host, target_port))
             tasks.append((proxy.identifier, task))
         
         for identifier, task in tasks:
@@ -494,7 +494,7 @@ class VlessProxyPool:
 
 # 全局代理池实例
 _global_proxy_pool: Optional[VlessProxyPool] = None
-_proxy_pool_initialized = False
+_proxy_pool_initialized: bool = False
 
 
 def get_proxy_pool() -> VlessProxyPool:
