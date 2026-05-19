@@ -1,335 +1,396 @@
-import asyncio
-import queue
+"""VLess Transport Layer - 支持同步和异步传输
+
+提供 VLess 协议的传输层抽象，支持：
+- TCP 传输（明文或 TLS）
+- WebSocket 传输（ws 或 wss）
+- 同步和异步两种接口
+"""
+
 import socket
 import ssl
-import threading
-from typing import Optional
+import struct
+import hashlib
+import hmac
+import base64
+import json
+import random
+import string
+from typing import Optional, Tuple, Dict, Any, Union
 from urllib.parse import urlparse
+import logging
 
-from .vless_proxy import VlessProxy, VlessProxyPool
-
-
-class HTTPAdapter:
-    """HTTP Adapter 基类 - 适配 httpx 的连接接口"""
-
-    def __init__(self, **kwargs):
-        pass
-
-    def get_connection(self, url: str, proxies: Optional[dict[str, str]] = None):
-        """获取连接 - 需要子类实现"""
-        raise NotImplementedError("get_connection must be implemented by subclass")
-
-    def send(
-        self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None
-    ):
-        """发送请求 - 需要子类实现"""
-        raise NotImplementedError("send must be implemented by subclass")
+logger = logging.getLogger(__name__)
 
 
-class VlessSocketWrapper:
-    """Vless Socket 包装器 - 将 asyncio StreamReader/Writer 包装为 socket-like 对象"""
-
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        self._reader = reader
-        self._writer = writer
-        self._loop = asyncio.get_event_loop()
-        self._closed = False
-
-        # 设置 socket 选项
-        self.family = socket.AF_INET
-        self.type = socket.SOCK_STREAM
-
-    def recv(self, bufsize: int, flags: int = 0) -> bytes:
-        """接收数据"""
-        if self._closed:
-            return b""
-
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._reader.read(bufsize), self._loop
-            )
-            return future.result(timeout=30)
-        except Exception as e:
-            raise socket.error(f"Recv error: {e}")
-
-    def recv_into(self, buffer: bytearray, nbytes: int = 0, flags: int = 0) -> int:
-        """接收数据到缓冲区"""
-        if self._closed:
-            return 0
-
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._reader.read(nbytes or len(buffer)), self._loop
-            )
-            data = future.result(timeout=30)
-            buffer[: len(data)] = data
-            return len(data)
-        except Exception as e:
-            raise socket.error(f"Recv error: {e}")
-
-    def send(self, data: bytes, flags: int = 0) -> int:
-        """发送数据"""
-        if self._closed:
-            raise socket.error("Socket is closed")
-
-        try:
-            self._writer.write(data)
-            future = asyncio.run_coroutine_threadsafe(self._writer.drain(), self._loop)
-            future.result(timeout=30)
-            return len(data)
-        except Exception as e:
-            raise socket.error(f"Send error: {e}")
-
-    def sendall(self, data: bytes, flags: int = 0):
-        """发送所有数据"""
-        self.send(data, flags)
-
-    def close(self):
-        """关闭 socket"""
-        self._closed = True
-        try:
-            self._writer.close()
-        except:
-            pass
-
-    def settimeout(self, timeout: float):
-        """设置超时（不实现，由外部处理）"""
-        pass
-
-    def setblocking(self, flag: bool):
-        """设置阻塞模式"""
-        pass
-
-    def shutdown(self, how: int):
-        """关闭 socket 的一部分"""
-        pass
-
-    def fileno(self) -> int:
-        """返回文件描述符"""
-        return -1
-
-    def getpeername(self):
-        """获取对端地址"""
-        return ("0.0.0.0", 0)
-
-    def getsockname(self):
-        """获取本地地址"""
-        return ("0.0.0.0", 0)
+class VLessProtocolError(Exception):
+    """VLess 协议错误"""
+    pass
 
 
-class VlessProxyConnection:
-    """Vless 代理连接包装器"""
+class VLessHandshakeError(VLessProtocolError):
+    """握手错误"""
+    pass
 
-    def __init__(self, proxy: VlessProxy, target_host: str, target_port: int):
-        self.proxy = proxy
-        self.target_host = target_host
-        self.target_port = target_port
-        self._socket: Optional[socket.socket] = None
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-        self._connected = False
 
-    def connect(self, timeout: float = 30) -> socket.socket:
+class VLessTransportError(VLessProtocolError):
+    """传输错误"""
+    pass
+
+
+class VLessRequestHeader:
+    """VLess 请求头构建器"""
+    
+    VERSION = 0
+    COMMAND_TCP = 1
+    COMMAND_UDP = 2
+    COMMAND_MUX = 3
+    
+    ADDR_TYPE_IPV4 = 1
+    ADDR_TYPE_DOMAIN = 2
+    ADDR_TYPE_IPV6 = 3
+    
+    @staticmethod
+    def build(uuid: str, target_host: str, target_port: int, command: int = COMMAND_TCP) -> bytes:
         """
-        建立 Vless 代理连接并返回 socket
-
-        Returns:
-            已连接的 socket
-        """
-        if self._connected:
-            return self._socket
-
-        # 创建事件循环在线程中运行
-        result_queue = queue.Queue()
-
-        def run_async():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            self._loop = loop
-
-            try:
-                reader, writer = loop.run_until_complete(
-                    asyncio.wait_for(
-                        self.proxy.create_connection(
-                            self.target_host, self.target_port
-                        ),
-                        timeout=timeout,
-                    )
-                )
-
-                self._reader = reader
-                self._writer = writer
-
-                # 获取底层 socket
-                transport = writer.transport
-                if hasattr(transport, "get_extra_info"):
-                    sock = transport.get_extra_info("socket")
-                    if sock:
-                        self._socket = sock
-                    else:
-                        # 对于 SSL 传输，获取原始 socket
-                        sock = transport.get_extra_info("ssl_object")
-                        if sock:
-                            self._socket = sock
-
-                # 如果没有获取到 socket，创建一个包装器
-                if self._socket is None:
-                    self._socket = VlessSocketWrapper(reader, writer)
-
-                self._connected = True
-                result_queue.put(("success", None))
-
-                # 保持事件循环运行
-                loop.run_forever()
-
-            except Exception as e:
-                result_queue.put(("error", e))
-            finally:
-                loop.close()
-
-        self._thread = threading.Thread(target=run_async, daemon=True)
-        self._thread.start()
-
-        # 等待连接结果
-        status, error = result_queue.get(timeout=timeout + 5)
-        if status == "error":
-            raise ConnectionError(f"Failed to establish Vless connection: {error}")
-
-        return self._socket
-
-    def close(self):
-        """关闭连接"""
-        if self._writer:
-            try:
-                self._writer.close()
-                if self._loop and self._loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        self._writer.wait_closed(), self._loop
-                    )
-            except:
-                pass
-
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-
-        self._connected = False
-
-
-class VlessHTTPAdapter(HTTPAdapter):
-    """
-    支持 Vless 代理的 HTTP Adapter
-
-    使用方式:
-        session = requests.Session()
-        adapter = VlessHTTPAdapter(proxy_pool=pool)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-    """
-
-    def __init__(
-        self,
-        proxy_pool: Optional[VlessProxyPool] = None,
-        proxy_strategy: str = "round_robin",
-        max_retries: int = 3,
-        **kwargs,
-    ):
-        """
-        初始化 Vless HTTP Adapter
-
+        构建 VLess 请求头
+        
         Args:
-            proxy_pool: Vless 代理池，为 None 则使用全局代理池
-            proxy_strategy: 代理选择策略 ('round_robin' 或 'random')
-            max_retries: 最大重试次数
+            uuid: UUID 字符串
+            target_host: 目标主机
+            target_port: 目标端口
+            command: 命令类型 (TCP/UDP/MUX)
+            
+        Returns:
+            请求头字节数据
         """
-        self.proxy_pool = proxy_pool or get_proxy_pool()
-        self.proxy_strategy = proxy_strategy
-        self.max_retries = max_retries
-        super().__init__(**kwargs)
-
-    def get_connection(self, url: str, proxies: Optional[dict[str, str]] = None):
-        """
-        获取连接
-
-        如果配置了 Vless 代理，使用代理连接
-        """
-        # 检查是否有可用的 Vless 代理
-        proxy = (
-            self.proxy_pool.get_proxy(self.proxy_strategy)
-            if self.proxy_pool.count > 0
-            else None
-        )
-
-        if proxy:
-            # 使用 Vless 代理
-            parsed = urlparse(url)
-            host = parsed.hostname
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-
+        # 验证并转换 UUID
+        try:
+            uuid_bytes = bytes.fromhex(uuid.replace('-', ''))
+            if len(uuid_bytes) != 16:
+                raise ValueError('Invalid UUID length')
+        except Exception as e:
+            raise VLessProtocolError(f'Invalid UUID format: {e}')
+        
+        header = bytearray()
+        
+        # Version (1 byte)
+        header.append(VLessRequestHeader.VERSION)
+        
+        # UUID (16 bytes)
+        header.extend(uuid_bytes)
+        
+        # Command (1 byte)
+        header.append(command)
+        
+        # Address Type and Address
+        try:
+            # 尝试 IPv4
+            socket.inet_pton(socket.AF_INET, target_host)
+            header.append(VLessRequestHeader.ADDR_TYPE_IPV4)
+            header.extend(socket.inet_pton(socket.AF_INET, target_host))
+        except OSError:
             try:
-                conn = VlessProxyConnection(proxy, host, port)
-                sock = conn.connect()
-
-                # 标记代理使用成功
-                proxy.mark_success()
-
-                # 返回一个包装过的连接
-                return VlessConnectionWrapper(sock, conn, parsed.scheme == "https")
-
-            except Exception as e:
-                proxy.mark_fail()
-                raise ConnectionError(f"Vless proxy connection failed: {e}")
-
-        # 没有代理，使用默认连接
-        return super().get_connection(url, proxies)
-
-    def send(
-        self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None
-    ):
-        """发送请求"""
-        # 如果启用了 Vless 代理，禁用 urllib3 的代理处理
-        if self.proxy_pool.count > 0:
-            proxies = None
-
-        return super().send(request, stream, timeout, verify, cert, proxies)
+                # 尝试 IPv6
+                socket.inet_pton(socket.AF_INET6, target_host)
+                header.append(VLessRequestHeader.ADDR_TYPE_IPV6)
+                header.extend(socket.inet_pton(socket.AF_INET6, target_host))
+            except OSError:
+                # 域名
+                domain_bytes = target_host.encode('utf-8')
+                if len(domain_bytes) > 255:
+                    raise VLessProtocolError('Domain name too long')
+                header.append(VLessRequestHeader.ADDR_TYPE_DOMAIN)
+                header.append(len(domain_bytes))
+                header.extend(domain_bytes)
+        
+        # Port (2 bytes, big-endian)
+        header.extend(struct.pack('>H', target_port))
+        
+        return bytes(header)
 
 
-class VlessConnectionWrapper:
-    """Vless 连接包装器 - 适配 urllib3 的连接接口"""
-
-    def __init__(self, sock: socket.socket, conn: VlessProxyConnection, is_https: bool):
-        self.sock = sock
-        self._vless_conn = conn
-        self.is_https = is_https
-        self._ssl_context: Optional[ssl.SSLContext] = None
-
-    def connect(self):
-        """连接（已连接，直接返回）"""
-        return self
-
+class VlessTransport:
+    """同步 VLess 传输层"""
+    
+    def __init__(self, uri: str):
+        """
+        初始化同步 VLess 传输
+        
+        Args:
+            uri: VLess URI (vless://...)
+        """
+        from deepseek_ai.vless_proxy import VlessURI
+        self.config = VlessURI(uri)
+        self._socket: Optional[socket.socket] = None
+        self._ssl_socket: Optional[ssl.SSLSocket] = None
+    
+    def connect(self, target_host: str, target_port: int, timeout: float = 30) -> socket.socket:
+        """
+        通过 VLess 代理连接到目标主机（返回原始 socket）
+        
+        Args:
+            target_host: 目标主机
+            target_port: 目标端口
+            timeout: 超时时间（秒）
+            
+        Returns:
+            已连接的 socket 对象
+        """
+        try:
+            # 1. 连接到 VLess 服务器
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((self.config.address, self.config.port))
+            
+            # 2. 如果需要 TLS，升级连接
+            if self.config.tls:
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                server_hostname = self.config.sni or self.config.address
+                ssl_sock = ssl_context.wrap_socket(sock, server_hostname=server_hostname)
+                self._ssl_socket = ssl_sock
+                sock = ssl_sock
+            
+            # 3. 发送 VLess 请求头
+            request_header = VLessRequestHeader.build(
+                self.config.uuid, target_host, target_port
+            )
+            sock.sendall(request_header)
+            
+            # 4. 读取响应（VLess 协议成功时无响应，直接开始数据传输）
+            # 某些实现可能返回一个字节的状态码，尝试非阻塞读取
+            sock.settimeout(0.1)
+            try:
+                response = sock.recv(1)
+                if response and response[0] != 0:
+                    raise VLessHandshakeError(f'Handshake failed with status: {response[0]}')
+            except socket.timeout:
+                # 没有响应是正常的
+                pass
+            finally:
+                sock.settimeout(timeout)
+            
+            self._socket = sock
+            return sock
+            
+        except socket.timeout:
+            raise VLessTransportError(f'Connection to {self.config.address}:{self.config.port} timed out')
+        except Exception as e:
+            raise VLessTransportError(f'Failed to establish VLess connection: {e}')
+    
+    def connect_tcp(self, target_host: str, target_port: int, timeout: float = 30) -> socket.socket:
+        """TCP 传输方式连接到目标主机"""
+        return self.connect(target_host, target_port, timeout)
+    
+    def connect_websocket(self, target_host: str, target_port: int, path: str = '/', host: str = None, timeout: float = 30) -> socket.socket:
+        """
+        WebSocket 传输方式连接到目标主机（简化实现）
+        
+        注意：完整的 WebSocket 支持需要实现帧编码/解码，
+        这里提供基础框架，建议使用 aiohttp/websockets 库实现完整的 WS 客户端
+        
+        Args:
+            target_host: 目标主机
+            target_port: 目标端口
+            path: WebSocket 路径
+            host: Host 头
+            timeout: 超时时间
+        """
+        # WebSocket 升级请求
+        key = base64.b64encode(os.urandom(16)).decode()
+        host_header = host or target_host
+        
+        ws_request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        
+        sock = self.connect(target_host, target_port, timeout)
+        sock.sendall(ws_request.encode())
+        
+        # 读取响应
+        response = sock.recv(1024).decode()
+        if "101" not in response:
+            raise VLessHandshakeError(f'WebSocket upgrade failed: {response}')
+        
+        return sock
+    
     def close(self):
         """关闭连接"""
-        self._vless_conn.close()
-        try:
-            self.sock.close()
-        except:
-            pass
-
-    def send(self, data: bytes):
-        """发送数据"""
-        return self.sock.send(data)
-
-    def recv(self, amt: int) -> bytes:
-        """接收数据"""
-        return self.sock.recv(amt)
-
-    def settimeout(self, timeout: float):
-        """设置超时"""
-        self.sock.settimeout(timeout)
-
+        if self._ssl_socket:
+            self._ssl_socket.close()
+        elif self._socket:
+            self._socket.close()
+        self._socket = None
+        self._ssl_socket = None
+    
     def __enter__(self):
         return self
-
-    def __exit__(self, *args):
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+class AsyncVlessTransport:
+    """异步 VLess 传输层"""
+    
+    def __init__(self, uri: str):
+        """
+        初始化异步 VLess 传输
+        
+        Args:
+            uri: VLess URI (vless://...)
+        """
+        from deepseek_ai.vless_proxy import VlessURI
+        self.config = VlessURI(uri)
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._transport = None
+    
+    async def connect(self, target_host: str, target_port: int, timeout: float = 30) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """
+        通过 VLess 代理连接到目标主机
+        
+        Args:
+            target_host: 目标主机
+            target_port: 目标端口
+            timeout: 超时时间（秒）
+            
+        Returns:
+            (reader, writer) 元组
+        """
+        import asyncio
+        
+        try:
+            # 1. 连接到 VLess 服务器
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.config.address, self.config.port),
+                timeout=timeout
+            )
+            
+            # 2. 如果需要 TLS，升级连接
+            if self.config.tls:
+                import ssl
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                server_hostname = self.config.sni or self.config.address
+                
+                loop = asyncio.get_event_loop()
+                transport = writer.transport
+                protocol = writer.transport.get_protocol()
+                
+                ssl_transport = await loop.start_tls(
+                    transport, protocol, ssl_context,
+                    server_hostname=server_hostname
+                )
+                
+                # 更新 reader/writer
+                self._reader = asyncio.StreamReader()
+                self._reader.set_transport(ssl_transport)
+                self._writer = asyncio.StreamWriter(ssl_transport, protocol, self._reader, loop)
+                reader, writer = self._reader, self._writer
+            
+            # 3. 发送 VLess 请求头
+            request_header = VLessRequestHeader.build(
+                self.config.uuid, target_host, target_port
+            )
+            writer.write(request_header)
+            await writer.drain()
+            
+            # 4. 读取响应（可选）
+            try:
+                response = await asyncio.wait_for(reader.read(1), timeout=1)
+                if response and response[0] != 0:
+                    raise VLessHandshakeError(f'Handshake failed with status: {response[0]}')
+            except asyncio.TimeoutError:
+                # 没有响应是正常的
+                pass
+            
+            self._reader, self._writer = reader, writer
+            return reader, writer
+            
+        except asyncio.TimeoutError:
+            raise VLessTransportError(f'Connection to {self.config.address}:{self.config.port} timed out')
+        except Exception as e:
+            raise VLessTransportError(f'Failed to establish async VLess connection: {e}')
+    
+    async def connect_tcp(self, target_host: str, target_port: int, timeout: float = 30) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """TCP 传输方式连接到目标主机"""
+        return await self.connect(target_host, target_port, timeout)
+    
+    async def connect_websocket(self, target_host: str, target_port: int, path: str = '/', host: str = None, timeout: float = 30) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """
+        WebSocket 传输方式连接到目标主机
+        
+        注意：完整 WebSocket 支持需要实现帧协议，
+        建议使用 websockets 或 aiohttp 库
+        
+        Args:
+            target_host: 目标主机
+            target_port: 目标端口
+            path: WebSocket 路径
+            host: Host 头
+            timeout: 超时时间
+        """
+        import asyncio
+        
+        # WebSocket 升级请求
+        key = base64.b64encode(os.urandom(16)).decode()
+        host_header = host or target_host
+        
+        ws_request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        
+        reader, writer = await self.connect(target_host, target_port, timeout)
+        writer.write(ws_request.encode())
+        await writer.drain()
+        
+        # 读取响应
+        response = await asyncio.wait_for(reader.read(1024), timeout=5)
+        response_str = response.decode()
+        
+        if "101" not in response_str:
+            raise VLessHandshakeError(f'WebSocket upgrade failed: {response_str}')
+        
+        return reader, writer
+    
+    async def close(self):
+        """关闭连接"""
+        if self._writer:
+            self._writer.close()
+            await self._writer.wait_closed()
+            self._reader = None
+            self._writer = None
+    
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
+
+# 辅助函数
+def create_vless_transport(uri: str) -> VlessTransport:
+    """创建同步 VLess 传输实例"""
+    return VlessTransport(uri)
+
+
+def create_async_vless_transport(uri: str) -> AsyncVlessTransport:
+    """创建异步 VLess 传输实例"""
+    return AsyncVlessTransport(uri)
