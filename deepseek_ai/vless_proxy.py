@@ -3,19 +3,14 @@
 支持 Vless 协议的 TCP 和 WebSocket 传输方式
 """
 
-import json
-import base64
-import hashlib
-import hmac
 import struct
 import socket
 import ssl
 import asyncio
 import random
-import string
 import os
-from typing import Optional, Dict, Any, Tuple, Union, List
-from urllib.parse import urlparse, parse_qs
+from typing import Optional, Dict, Any, Tuple
+from urllib.parse import parse_qs
 import logging
 
 logger = logging.getLogger(__name__)
@@ -26,7 +21,7 @@ class VlessURI:
     
     def __init__(self, uri: str):
         self.uri = uri
-        self.uuid: Optional[str] = None
+        self.uuid: str = ""
         self.address: Optional[str] = None
         self.port: Optional[int] = None
         self.security: str = 'none'
@@ -379,7 +374,6 @@ class VlessProxyPool:
         Returns:
             (成功数量, 失败数量)
         """
-        import os
         uris_str = os.environ.get(env_var, '')
         if not uris_str:
             return 0, 0
@@ -523,7 +517,6 @@ def init_proxy_pool_from_env() -> VlessProxyPool:
     pool.add_proxies_from_env('VLESS_PROXIES')
     
     # 也检查 VLESS_PROXY_FILE 环境变量
-    import os
     proxy_file = os.environ.get('VLESS_PROXY_FILE')
     if proxy_file:
         pool.add_proxies_from_file(proxy_file)
