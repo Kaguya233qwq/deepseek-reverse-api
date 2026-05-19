@@ -18,7 +18,7 @@ if __name__ == "__main__":
     print(f"Features: Account Pool, Vless Proxy Support, OpenAI Compatible API")
     
     uvicorn.run(
-        "server:app",
+        "server:asgi_app",
         host=host,
         port=port,
         reload=False,

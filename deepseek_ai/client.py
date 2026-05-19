@@ -1,7 +1,6 @@
 """DeepSeek Client - OpenAI compatible interface"""
 
 from typing import List, Dict, Optional, Any, Generator, Union
-import json
 from .adapter import DeepSeekAdapter
 from .stream_handler import DeepSeekStreamHandler
 
@@ -18,7 +17,7 @@ class DeepSeekClient:
         """
         self.adapter = DeepSeekAdapter(token, use_proxy=use_proxy)
         self._session_id: Optional[str] = None
-    
+
     def chat_completions(
         self,
         model: str,
@@ -30,7 +29,7 @@ class DeepSeekClient:
         thinking_enabled: Optional[bool] = None,
         tools: Optional[List[Dict]] = None,
         tool_choice: Optional[Any] = None,
-        auto_delete_session: bool = False
+        auto_delete_session: bool = False,
     ) -> Union[Generator[str, None, None], Dict]:
         """Chat completions API
 
@@ -51,34 +50,44 @@ class DeepSeekClient:
         """
         # Process messages with tool support
         processed_messages = messages.copy()
-        
+
         if tools:
             has_tool_prompt = any(
-                msg.get('role') == 'system' and
-                ('Available Tools' in msg.get('content', '') or '<tools>' in msg.get('content', ''))
+                msg.get("role") == "system"
+                and (
+                    "Available Tools" in msg.get("content", "")
+                    or "<tools>" in msg.get("content", "")
+                )
                 for msg in messages
             )
 
             if not has_tool_prompt:
                 from .tool_parser import ToolParser
+
                 tool_prompt = ToolParser.tools_to_system_prompt(tools)
 
-                system_messages = [msg for msg in processed_messages if msg.get('role') == 'system']
+                system_messages = [
+                    msg for msg in processed_messages if msg.get("role") == "system"
+                ]
                 if system_messages:
-                    system_messages[0]['content'] = system_messages[0]['content'] + '\n\n' + tool_prompt
+                    system_messages[0]["content"] = (
+                        system_messages[0]["content"] + "\n\n" + tool_prompt
+                    )
                 else:
-                    processed_messages.insert(0, {'role': 'system', 'content': tool_prompt})
+                    processed_messages.insert(
+                        0, {"role": "system", "content": tool_prompt}
+                    )
 
-        response, session_id = self.adapter.chat_completion(
+        response, session_id = self.adapter.chat_completion(  # pyright: ignore[reportGeneralTypeIssues]
             model=model,
             messages=processed_messages,
             stream=True,  # Always stream from backend
             temperature=temperature,
             web_search=web_search,
             reasoning_effort=reasoning_effort,
-            thinking_enabled=thinking_enabled
+            thinking_enabled=thinking_enabled,
         )
-        
+
         self._session_id = session_id
 
         handler = DeepSeekStreamHandler(
@@ -86,26 +95,29 @@ class DeepSeekClient:
             session_id,
             on_end=lambda: self._on_stream_end(auto_delete_session),
             web_search_enabled=web_search,
-            reasoning_effort=reasoning_effort
+            reasoning_effort=reasoning_effort,
         )
 
         if stream:
             return handler.handle_stream(response)
         else:
             return handler.handle_non_stream(response)
-    
+
     def _on_stream_end(self, auto_delete_session: bool):
         """Handle stream end callback"""
         if auto_delete_session and self._session_id:
             import threading
-            threading.Thread(target=self.delete_session, args=(self._session_id,)).start()
-    
+
+            threading.Thread(
+                target=self.delete_session, args=(self._session_id,)
+            ).start()
+
     def delete_session(self, session_id: str) -> bool:
         """Delete a session
-        
+
         Args:
             session_id: Session ID
-        
+
         Returns:
             bool: True if deletion was successful
         """

@@ -69,7 +69,7 @@ class DeepSeekStreamHandler:
             if not line:
                 continue
             
-            line_str = line.decode('utf-8')
+            line_str = line if isinstance(line, str) else line.decode('utf-8')
             if not line_str.startswith('data:'):
                 continue
             
@@ -323,7 +323,7 @@ class DeepSeekStreamHandler:
             if not line:
                 continue
             
-            line_str = line.decode('utf-8')
+            line_str = line if isinstance(line, str) else line.decode('utf-8')
             if not line_str.startswith('data:'):
                 continue
             

@@ -1,0 +1,19 @@
+[project]
+name = "deepseek-reverse-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "asgiref>=3.11.1",
+    "flask>=3.1.3",
+    "flask-cors>=6.0.2",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
+    "uvicorn>=0.47.0",
+    "wasmtime>=44.0.0",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "basic"
