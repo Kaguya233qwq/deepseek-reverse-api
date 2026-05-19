@@ -278,4 +278,104 @@ class AccountPool:
             "x-client-platform": "web",
             "x-client-timezone-offset": "28800",
             "x-client-version": "1.8.0",
-            "referrer": "https://chat本回答由 AI 生成，内容仅供参考，请仔细甄别。INCOMPLETE
+            "referrer": "https://chat.deepseek.com/sign_in",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0"
+        }
+
+        data = {
+            "email": email,
+            "mobile": "",
+            "password": password,
+            "area_code": "",
+            "device_id": "",
+            "os": "web"
+        }
+
+        # 获取代理管理器创建的客户端
+        proxy_manager = get_proxy_manager()
+        if not proxy_manager._initialized:
+            proxy_manager.init_from_env()
+        
+        # 使用带代理的客户端
+        async with proxy_manager.create_async_session(use_vless=True) as client:
+            response = await client.post(url, headers=headers, json=data)
+
+            if response.status_code != 200:
+                raise Exception(f"登录失败: HTTP {response.status_code}, {response.text}")
+
+            result = response.json()
+
+            if result.get("code") != 0:
+                error_msg = result.get("msg") or result.get("data", {}).get("biz_msg") or "Unknown error"
+                raise Exception(f"登录失败: {error_msg}")
+
+            # 提取 Token
+            biz_data = result.get("data", {}).get("biz_data", {})
+            user = biz_data.get("user", {})
+            token = user.get("token")
+
+            if not token:
+                raise Exception("登录成功但未获取到 Token")
+
+            return token
+
+    def _is_token_expired(self, token: str) -> bool:
+        """检查Token是否过期（简单检查，实际需要调用API验证）"""
+        # 简单实现：如果token在tokens中且状态健康，认为未过期
+        if token in self.tokens:
+            info = self.tokens[token]
+            return info.status == TokenStatus.UNHEALTHY
+        return False
+
+    def get_token(self, strategy: str = "round_robin") -> Optional[str]:
+        """获取一个可用的Token"""
+        healthy_tokens = [t for t, info in self.tokens.items() if info.status == TokenStatus.HEALTHY]
+        
+        if not healthy_tokens:
+            # 如果没有健康token，尝试使用未知状态的
+            healthy_tokens = [t for t, info in self.tokens.items() if info.status == TokenStatus.UNKNOWN]
+        
+        if not healthy_tokens:
+            return None
+        
+        if strategy == "random":
+            return random.choice(healthy_tokens)
+        else:  # round_robin
+            with self._lock:
+                token = healthy_tokens[self._current_index % len(healthy_tokens)]
+                self._current_index += 1
+                return token
+
+    def mark_token_success(self, token: str, response_time: float = 0):
+        """标记Token使用成功"""
+        if token in self.tokens:
+            self.tokens[token].mark_success(response_time)
+            self._save_state()
+
+    def mark_token_fail(self, token: str, error: str = ""):
+        """标记Token使用失败"""
+        if token in self.tokens:
+            self.tokens[token].mark_fail(error)
+            self._save_state()
+
+    def _save_state(self):
+        """保存状态到文件"""
+        try:
+            data = {
+                'tokens': [info.to_dict() for info in self.tokens.values()]
+            }
+            with open(self.storage_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[AccountPool] Failed to save state: {e}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """获取账号池统计信息"""
+        return {
+            'total_tokens': len(self.tokens),
+            'healthy_tokens': sum(1 for info in self.tokens.values() if info.status == TokenStatus.HEALTHY),
+            'unhealthy_tokens': sum(1 for info in self.tokens.values() if info.status == TokenStatus.UNHEALTHY),
+            'total_accounts': len(self.accounts),
+            'token_details': [info.to_dict() for info in self.tokens.values()],
+            'account_details': [acc.to_dict() for acc in self.accounts.values()]
+        }
