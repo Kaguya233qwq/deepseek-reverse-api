@@ -15,6 +15,8 @@ import base64
 import json
 import random
 import string
+import os
+import asyncio
 from typing import Optional, Tuple, Dict, Any, Union
 from urllib.parse import urlparse
 import logging
@@ -266,8 +268,6 @@ class AsyncVlessTransport:
         Returns:
             (reader, writer) 元组
         """
-        import asyncio
-        
         try:
             # 1. 连接到 VLess 服务器
             reader, writer = await asyncio.wait_for(
@@ -277,7 +277,6 @@ class AsyncVlessTransport:
             
             # 2. 如果需要 TLS，升级连接
             if self.config.tls:
-                import ssl
                 ssl_context = ssl.create_default_context()
                 ssl_context.check_hostname = False
                 ssl_context.verify_mode = ssl.CERT_NONE
@@ -341,8 +340,6 @@ class AsyncVlessTransport:
             host: Host 头
             timeout: 超时时间
         """
-        import asyncio
-        
         # WebSocket 升级请求
         key = base64.b64encode(os.urandom(16)).decode()
         host_header = host or target_host
