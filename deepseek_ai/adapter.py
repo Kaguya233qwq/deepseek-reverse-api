@@ -2,12 +2,27 @@
 
 import uuid
 import time
-from typing import Dict, Optional, Tuple, Union
+import threading
+from typing import Dict, Optional, Tuple, Union, List
+import re
 
 import httpx
 
 from .proxy_adapter import get_proxy_manager, init_proxy_manager
 from .pow_solver import calculate_challenge_answer
+
+
+class DeepSeekAPIError(Exception):
+    """DeepSeek API 基础异常"""
+    pass
+
+class DeepSeekAuthError(DeepSeekAPIError):
+    """认证相关错误（Token无效/过期）"""
+    pass
+
+class DeepSeekRequestError(DeepSeekAPIError):
+    """请求错误"""
+    pass
 
 
 class DeepSeekAdapter:
@@ -39,6 +54,10 @@ class DeepSeekAdapter:
         "deepseek-v4-flash": "deepseek-chat",
         "deepseek-v4-pro": "deepseek-reasoner",
     }
+    
+    # 可配置的超时/过期时间
+    TOKEN_EXPIRY_SECONDS = 3600  # 1小时
+    SESSION_EXPIRY_SECONDS = 300  # 5分钟
 
     def __init__(self, token: str, use_proxy: bool = True, async_mode: bool = False):
         """Initialize DeepSeek Adapter
@@ -55,6 +74,10 @@ class DeepSeekAdapter:
         self._session_created_at: int = 0
         self.use_proxy = use_proxy
         self.async_mode = async_mode
+        
+        # 线程锁，保护共享状态
+        self._sync_lock = threading.Lock()
+        self._async_lock = None  # 在异步方法中动态创建 asyncio.Lock
 
         # Initialize proxy manager if needed
         if use_proxy:
@@ -101,44 +124,46 @@ class DeepSeekAdapter:
 
     # --- Sync methods ---
     def _acquire_token_sync(self) -> str:
-        """Acquire access token from DeepSeek (sync)"""
+        """Acquire access token from DeepSeek (sync, thread-safe)"""
         if not self.token:
-            raise ValueError("DeepSeek token not configured")
+            raise DeepSeekAuthError("DeepSeek token not configured")
 
-        if self._access_token and self._token_expires_at > int(time.time()):
+        with self._sync_lock:
+            if self._access_token and self._token_expires_at > int(time.time()):
+                return self._access_token
+
+            url = f"{self.DEEPSEEK_API_BASE}/v0/users/current"
+            response = self.client.get(
+                url, headers={"Authorization": f"Bearer {self.token}", **self.get_headers()}
+            )
+
+            if response.status_code in [401, 403]:
+                raise DeepSeekAuthError("Token invalid or expired, please get a new token")
+
+            if response.status_code != 200:
+                raise DeepSeekRequestError(f"Failed to acquire token: HTTP {response.status_code}")
+
+            data = response.json()
+            biz_data = data.get("data", {}).get("biz_data") or data.get("biz_data")
+
+            if not biz_data or not biz_data.get("token"):
+                error_msg = (
+                    data.get("msg")
+                    or data.get("data", {}).get("biz_msg")
+                    or "Unknown error"
+                )
+                raise DeepSeekRequestError(f"Failed to acquire token: {error_msg}")
+
+            self._access_token = biz_data["token"]
+            self._token_expires_at = int(time.time()) + self.TOKEN_EXPIRY_SECONDS
+
             return self._access_token
 
-        url = f"{self.DEEPSEEK_API_BASE}/v0/users/current"
-        response = self.client.get(
-            url, headers={"Authorization": f"Bearer {self.token}", **self.get_headers()}
-        )
-
-        if response.status_code in [401, 403]:
-            raise ValueError("Token invalid or expired, please get a new token")
-
-        if response.status_code != 200:
-            raise ValueError(f"Failed to acquire token: HTTP {response.status_code}")
-
-        data = response.json()
-        biz_data = data.get("data", {}).get("biz_data") or data.get("biz_data")
-
-        if not biz_data or not biz_data.get("token"):
-            error_msg = (
-                data.get("msg")
-                or data.get("data", {}).get("biz_msg")
-                or "Unknown error"
-            )
-            raise ValueError(f"Failed to acquire token: {error_msg}")
-
-        self._access_token = biz_data["token"]
-        self._token_expires_at = int(time.time()) + 3600
-
-        return self._access_token
-
     def _create_session_sync(self) -> str:
-        """Create a new chat session (sync)"""
-        if self._session_id and (time.time() - self._session_created_at) < 300:
-            return self._session_id
+        """Create a new chat session (sync, thread-safe)"""
+        with self._sync_lock:
+            if self._session_id and (time.time() - self._session_created_at) < self.SESSION_EXPIRY_SECONDS:
+                return self._session_id
 
         token = self._acquire_token_sync()
 
@@ -156,7 +181,7 @@ class DeepSeekAdapter:
         biz_data = data.get("data", {}).get("biz_data") or data.get("biz_data")
 
         if response.status_code != 200 or not biz_data:
-            raise ValueError(
+            raise DeepSeekRequestError(
                 f"Failed to create session: {data.get('msg') or response.status_code}"
             )
 
@@ -166,10 +191,11 @@ class DeepSeekAdapter:
             session_id = biz_data.get("id")
 
         if not session_id:
-            raise ValueError("Failed to create session: no session id in response")
+            raise DeepSeekRequestError("Failed to create session: no session id in response")
 
-        self._session_id = session_id
-        self._session_created_at = time.time()
+        with self._sync_lock:
+            self._session_id = session_id
+            self._session_created_at = time.time()
 
         return self._session_id
 
@@ -190,7 +216,7 @@ class DeepSeekAdapter:
         biz_data = data.get("data", {}).get("biz_data") or data.get("biz_data")
 
         if response.status_code != 200 or not biz_data or not biz_data.get("challenge"):
-            raise ValueError(
+            raise DeepSeekRequestError(
                 f"Failed to get challenge: {data.get('msg') or response.status_code}"
             )
 
@@ -202,10 +228,10 @@ class DeepSeekAdapter:
             answer = calculate_challenge_answer(challenge)
             return answer
         except Exception as e:
-            raise ValueError(f"Failed to calculate challenge answer: {e}")
+            raise DeepSeekRequestError(f"Failed to calculate challenge answer: {e}")
 
-    def _messages_to_prompt(self, messages: list) -> str:
-        """Convert messages to DeepSeek prompt format"""
+    def _messages_to_prompt(self, messages: List[Dict]) -> str:
+        """Convert messages to DeepSeek prompt format (more robust)"""
         processed_messages = []
 
         for message in messages:
@@ -252,18 +278,24 @@ class DeepSeekAdapter:
         result = []
         for index, block in enumerate(merged_blocks):
             if block["role"] == "assistant":
-                result.append(f"<｜Assistant｜>{block['text']}<｜end of sentence｜>")
+                # 转义潜在的分隔符
+                safe_text = block["text"].replace("<｜", "&lt;｜")
+                result.append(f"<｜Assistant｜>{safe_text}<｜end of sentence｜>")
             elif block["role"] in ["user", "system"]:
+                safe_text = block["text"].replace("<｜", "&lt;｜")
                 result.append(
-                    f"<｜User｜>{block['text']}" if index > 0 else block["text"]
+                    f"<｜User｜>{safe_text}" if index > 0 else safe_text
                 )
             elif block["role"] == "tool":
-                result.append(f"<｜User｜>{block['text']}")
+                safe_text = block["text"].replace("<｜", "&lt;｜")
+                result.append(f"<｜User｜>{safe_text}")
 
         prompt = "".join(result)
-        import re
-
-        prompt = re.sub(r"!\[.+\]\(.+\)", "", prompt)
+        
+        # 移除 Markdown 图片，但避免误删其他内容
+        prompt = re.sub(r'!\[.*?\]\(.*?\)', '', prompt)
+        # 移除可能残留的 HTML 标签
+        prompt = re.sub(r'<[^>]+>', '', prompt)
 
         return prompt
 
@@ -286,267 +318,4 @@ class DeepSeekAdapter:
 
         prompt = self._messages_to_prompt(messages)
 
-        search_enabled = web_search
-
-        # Determine thinking mode
-        if thinking_enabled is None:
-            model_lower = model.lower()
-            if "-think" in model_lower:
-                thinking_enabled = True
-            elif "-fast" in model_lower:
-                thinking_enabled = False
-            elif reasoning_effort:
-                thinking_enabled = True
-            else:
-                thinking_enabled = "pro" in model_lower
-
-        url = f"{self.DEEPSEEK_API_BASE}/v0/chat/completion"
-
-        model_type = "expert" if thinking_enabled else "default"
-
-        payload = {
-            "chat_session_id": session_id,
-            "parent_message_id": None,
-            "model_type": model_type,
-            "prompt": prompt,
-            "ref_file_ids": [],
-            "thinking_enabled": thinking_enabled,
-            "_enabled": search_enabled,
-            "preempt": False,
-        }
-
-        response = self.client.post(
-            url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                **self.get_headers(),
-                "X-Ds-Pow-Response": challenge_answer,
-            },
-            timeout=120.0,
-        )
-
-        if response.status_code != 200:
-            raise ValueError(f"Chat completion failed: HTTP {response.status_code}")
-
-        return response, session_id
-
-    # --- Async methods (to be implemented for full async) ---
-    async def _acquire_token_async(self) -> str:
-        """Acquire access token from DeepSeek (async)"""
-        if not self.token:
-            raise ValueError("DeepSeek token not configured")
-
-        if self._access_token and self._token_expires_at > int(time.time()):
-            return self._access_token
-
-        url = f"{self.DEEPSEEK_API_BASE}/v0/users/current"
-        response = await self.client.get(
-            url, headers={"Authorization": f"Bearer {self.token}", **self.get_headers()}
-        )
-
-        if response.status_code in [401, 403]:
-            raise ValueError("Token invalid or expired, please get a new token")
-
-        if response.status_code != 200:
-            raise ValueError(f"Failed to acquire token: HTTP {response.status_code}")
-
-        data = response.json()
-        biz_data = data.get("data", {}).get("biz_data") or data.get("biz_data")
-
-        if not biz_data or not biz_data.get("token"):
-            error_msg = (
-                data.get("msg")
-                or data.get("data", {}).get("biz_msg")
-                or "Unknown error"
-            )
-            raise ValueError(f"Failed to acquire token: {error_msg}")
-
-        self._access_token = biz_data["token"]
-        self._token_expires_at = int(time.time()) + 3600
-
-        return self._access_token
-
-    async def _create_session_async(self) -> str:
-        """Create a new chat session (async)"""
-        if self._session_id and (time.time() - self._session_created_at) < 300:
-            return self._session_id
-
-        token = await self._acquire_token_async()
-
-        url = f"{self.DEEPSEEK_API_BASE}/v0/chat_session/create"
-        response = await self.client.post(
-            url,
-            json={"character_id": None},
-            headers={
-                "Authorization": f"Bearer {token}",
-                **self.get_headers(),
-            },
-        )
-
-        data = response.json()
-        biz_data = data.get("data", {}).get("biz_data") or data.get("biz_data")
-
-        if response.status_code != 200 or not biz_data:
-            raise ValueError(
-                f"Failed to create session: {data.get('msg') or response.status_code}"
-            )
-
-        if "chat_session" in biz_data and isinstance(biz_data["chat_session"], dict):
-            session_id = biz_data["chat_session"].get("id")
-        else:
-            session_id = biz_data.get("id")
-
-        if not session_id:
-            raise ValueError("Failed to create session: no session id in response")
-
-        self._session_id = session_id
-        self._session_created_at = time.time()
-
-        return self._session_id
-
-    async def _get_challenge_async(self, target_path: str) -> Dict:
-        """Get POW challenge from DeepSeek (async)"""
-        token = await self._acquire_token_async()
-        url = f"{self.DEEPSEEK_API_BASE}/v0/chat/create_pow_challenge"
-        response = await self.client.post(
-            url,
-            json={"target_path": target_path},
-            headers={
-                "Authorization": f"Bearer {token}",
-                **self.get_headers(),
-            },
-        )
-
-        data = response.json()
-        biz_data = data.get("data", {}).get("biz_data") or data.get("biz_data")
-
-        if response.status_code != 200 or not biz_data or not biz_data.get("challenge"):
-            raise ValueError(
-                f"Failed to get challenge: {data.get('msg') or response.status_code}"
-            )
-
-        return biz_data["challenge"]
-
-    async def chat_completion_async(
-        self,
-        model: str,
-        messages: list,
-        stream: bool = True,
-        temperature: Optional[float] = None,
-        web_search: bool = False,
-        reasoning_effort: Optional[str] = None,
-        thinking_enabled: Optional[bool] = None,
-    ) -> Tuple[httpx.Response, str]:
-        """Send chat completion request (async)"""
-        token = await self._acquire_token_async()
-        session_id = await self._create_session_async()
-
-        challenge = await self._get_challenge_async("/api/v0/chat/completion")
-        challenge_answer = self._calculate_challenge_answer(challenge)  # Sync WASM call
-
-        prompt = self._messages_to_prompt(messages)
-
-        search_enabled = web_search
-
-        if thinking_enabled is None:
-            model_lower = model.lower()
-            if "-think" in model_lower:
-                thinking_enabled = True
-            elif "-fast" in model_lower:
-                thinking_enabled = False
-            elif reasoning_effort:
-                thinking_enabled = True
-            else:
-                thinking_enabled = "pro" in model_lower
-
-        url = f"{self.DEEPSEEK_API_BASE}/v0/chat/completion"
-
-        model_type = "expert" if thinking_enabled else "default"
-
-        payload = {
-            "chat_session_id": session_id,
-            "parent_message_id": None,
-            "model_type": model_type,
-            "prompt": prompt,
-            "ref_file_ids": [],
-            "thinking_enabled": thinking_enabled,
-            "_enabled": search_enabled,
-            "preempt": False,
-        }
-
-        request = self.client.build_request(
-            "POST",
-            url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                **self.get_headers(),
-                "X-Ds-Pow-Response": challenge_answer,
-            },
-            timeout=120.0,
-        )
-        response = await self.client.send(request, stream=True)
-
-        if response.status_code != 200:
-            raise ValueError(f"Chat completion failed: HTTP {response.status_code}")
-
-        return response, session_id
-
-
-    async def delete_session_async(self, session_id: str) -> bool:
-        """Delete a chat session (async)"""
-        try:
-            token = await self._acquire_token_async()
-            url = f"{self.DEEPSEEK_API_BASE}/v0/chat_session/delete"
-            response = await self.client.post(
-                url,
-                json={"chat_session_id": session_id},
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    **self.get_headers(),
-                },
-            )
-
-            data = response.json()
-            success = response.status_code == 200 and data.get("code") == 0
-
-            if success and self._session_id == session_id:
-                self._session_id = None
-
-            return success
-        except Exception:
-            return False
-
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a chat session (sync)"""
-        try:
-            token = self._acquire_token_sync()
-            url = f"{self.DEEPSEEK_API_BASE}/v0/chat_session/delete"
-            response = self.client.post(
-                url,
-                json={"chat_session_id": session_id},
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    **self.get_headers(),
-                },
-            )
-
-            data = response.json()
-            success = response.status_code == 200 and data.get("code") == 0
-
-            if success and self._session_id == session_id:
-                self._session_id = None
-
-            return success
-        except Exception:
-            return False
-
-    @staticmethod
-    def is_deepseek_provider(api_endpoint: str) -> bool:
-        """Check if the API endpoint is DeepSeek"""
-        return "deepseek.com" in api_endpoint
-
-    def close(self):
-        """Close the underlying httpx client"""
-        self.client.close()
+        search_enabled =本回答由 AI 生成，内容仅供参考，请仔细甄别。INCOMPLETE
