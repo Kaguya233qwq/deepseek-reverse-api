@@ -318,4 +318,52 @@ class DeepSeekAdapter:
 
         prompt = self._messages_to_prompt(messages)
 
-        search_enabled =本回答由 AI 生成，内容仅供参考，请仔细甄别。INCOMPLETE
+        # 构建请求体
+        payload = {
+            "chat_session_id": session_id,
+            "parent_message_id": self._uuid(),
+            "prompt": prompt,
+            "model": self.map_model(model),
+            "stream": stream,
+        }
+
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = reasoning_effort
+        if thinking_enabled is not None:
+            payload["thinking_enabled"] = thinking_enabled
+
+        # 添加工具/函数调用支持（如果需要）
+        # 根据您的原始代码，这里可能还有其他逻辑，但基础版本先保持简单
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Ds-Pow-Response": challenge_answer,
+            **self.get_headers(),
+        }
+
+        url = f"{self.DEEPSEEK_API_BASE}/v0/chat/completion"
+
+        response = self.client.post(url, json=payload, headers=headers)
+
+        if response.status_code != 200:
+            # 尝试解析错误信息
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("msg") or error_data.get("error") or "Unknown error"
+            except Exception:
+                error_msg = f"HTTP {response.status_code}"
+            raise DeepSeekRequestError(f"Chat completion failed: {error_msg}")
+
+        if stream:
+            # 对于流式响应，返回 response 对象，由调用方处理流
+            return response
+        else:
+            # 对于非流式响应，也返回 response 对象，调用方可直接 .json()
+            return response
+
+    def close(self):
+        """关闭 HTTP 客户端"""
+        if hasattr(self, 'client') and self.client:
+            self.client.close()
