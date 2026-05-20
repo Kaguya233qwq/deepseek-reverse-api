@@ -77,7 +77,8 @@ class ProxyManager:
         if use_vless and self.vless_pool and self.vless_pool.count > 0:
             # 使用 VLess 代理
 
-            transport = VlessTransport(proxy_pool=self.vless_pool)
+            proxy = self.vless_pool.get_proxy()
+            transport = VlessTransport(uri=proxy.uri if proxy else "")
             return httpx.AsyncClient(transport=transport, timeout=timeout)
         else:
             # 使用普通 HTTP 代理
@@ -110,7 +111,7 @@ class ProxyManager:
 
     def get_stats(self) -> Dict[str, Any]:
         """获取代理统计信息"""
-        stats = {
+        stats: Dict[str, Any] = {
             "http_proxy": self.http_proxy,
             "https_proxy": self.https_proxy,
         }

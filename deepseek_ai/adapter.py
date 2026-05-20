@@ -2,7 +2,7 @@
 
 import uuid
 import time
-from typing import Dict, Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, List
 import re
 
 import httpx
@@ -74,8 +74,8 @@ class DeepSeekAdapter:
         self.token = token
         self._access_token: Optional[str] = None
         self._token_expires_at: int = 0
-        self._session_id: Optional[str] = None
-        self._session_created_at: int = 0
+        self._session_id: str = ""
+        self._session_created_at: float = 0
         self.use_proxy = use_proxy
 
         # 异步锁，保护共享状态
@@ -121,7 +121,7 @@ class DeepSeekAdapter:
         return base_model
 
     # --- Sync methods ---
-    async def _acquire_token_async(self) -> str:
+    async def _acquire_token_async(self) -> str | None:
         """Acquire access token from DeepSeek (sync, thread-safe)"""
         if not self.token:
             raise DeepSeekAuthError("DeepSeek token not configured")
@@ -325,7 +325,7 @@ class DeepSeekAdapter:
         web_search: bool = False,
         reasoning_effort: Optional[str] = None,
         thinking_enabled: Optional[bool] = None,
-    ) -> Union[httpx.Response, Tuple[httpx.Response, str]]:
+    ) -> Tuple[httpx.Response, str]:
         """Send chat completion request (sync)"""
         token = await self._acquire_token_async()
         session_id = await self._create_session_async()
@@ -338,10 +338,12 @@ class DeepSeekAdapter:
         # 构建请求体
         payload = {
             "chat_session_id": session_id,
-            "parent_message_id": self._uuid(),
+            "parent_message_id": 0,
             "prompt": prompt,
             "model": self.map_model(model),
             "stream": stream,
+            "search_enabled": web_search,
+            "ref_file_ids": [],
         }
 
         if temperature is not None:
@@ -365,6 +367,7 @@ class DeepSeekAdapter:
         response = await self.client.post(url, json=payload, headers=headers)
 
         if response.status_code != 200:
+            print(f"DEBUG RESPONSE: {response.text}")
             # 尝试解析错误信息
             try:
                 error_data = response.json()
@@ -375,12 +378,7 @@ class DeepSeekAdapter:
                 error_msg = f"HTTP {response.status_code}"
             raise DeepSeekRequestError(f"Chat completion failed: {error_msg}")
 
-        if stream:
-            # 对于流式响应，返回 response 对象，由调用方处理流
-            return response
-        else:
-            # 对于非流式响应，也返回 response 对象，调用方可直接 .json()
-            return response
+        return response, session_id
 
     async def close(self):
         """关闭 HTTP 客户端"""
@@ -403,7 +401,7 @@ class DeepSeekAdapter:
             data = response.json()
             success = response.status_code == 200 and data.get("code") == 0
             if success and self._session_id == session_id:
-                self._session_id = None
+                self._session_id = ""
             return success
         except Exception:
             return False

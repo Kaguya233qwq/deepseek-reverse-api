@@ -8,6 +8,7 @@ import os
 import json
 import time
 import logging
+from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -15,15 +16,15 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from dotenv import load_dotenv
 
-# 加载环境变量
-load_dotenv()
-
-# 导入 deepseek_ai 模块
+# 导入 deepseek模块
 from deepseek_ai import DeepSeekClient
 from deepseek_ai.proxy_adapter import init_proxy_manager
 from deepseek_ai.subscription import init_subscriptions_from_env
 from deepseek_ai.node_storage import init_node_storage
 from deepseek_ai.node_tester import init_node_tester
+
+# 加载环境变量
+load_dotenv()
 
 # 配置日志
 logging.basicConfig(
@@ -182,7 +183,6 @@ async def chat_completions(request: Request):
         reasoning_effort = data.get("reasoning_effort")
         thinking = data.get("thinking")  # OpenAI compatible format: {"type": "enabled"}
         tools = data.get("tools")
-        tool_choice = data.get("tool_choice")
 
         # Create client
         client = DeepSeekClient(token=token, use_proxy=True)
@@ -213,26 +213,26 @@ async def chat_completions(request: Request):
                 # Default: flash = no thinking, pro = thinking
                 thinking_enabled = "pro" in model_lower
 
-        if stream:
+        result = await client.chat_completions(
+            model=model,
+            messages=messages,
+            stream=stream,
+            temperature=temperature,
+            web_search=web_search,
+            reasoning_effort=reasoning_effort,
+            thinking_enabled=thinking_enabled,
+            tools=tools,
+            auto_delete_session=AUTO_DELETE_SESSION,
+        )
+
+        if isinstance(result, AsyncGenerator):
+            print("Streaming response initiated")
+
             # Streaming response
             async def generate():
                 try:
-                    result = await client.chat_completions(
-                        model=model,
-                        messages=messages,
-                        stream=True,
-                        temperature=temperature,
-                        web_search=web_search,
-                        reasoning_effort=reasoning_effort,
-                        thinking_enabled=thinking_enabled,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                        auto_delete_session=AUTO_DELETE_SESSION,
-                    )
-
                     async for chunk in result:
                         yield chunk
-
                 except Exception as e:
                     logger.error(f"[Server] Stream error: {e}")
                     error_chunk = json.dumps(
@@ -242,39 +242,26 @@ async def chat_completions(request: Request):
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(generate(), media_type="text/event-stream")
-        else:
+        if isinstance(result, dict):
             # Non-streaming response
-            result = await client.chat_completions(
-                model=model,
-                messages=messages,
-                stream=False,
-                temperature=temperature,
-                web_search=web_search,
-                reasoning_effort=reasoning_effort,
-                thinking_enabled=thinking_enabled,
-                tools=tools,
-                tool_choice=tool_choice,
-                auto_delete_session=AUTO_DELETE_SESSION,
-            )
-
-            return result
+            return JSONResponse(content=result)
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"[Server] Error: {e}")
-        # Simple heuristic to return 401 if it's token/auth related string
-        if isinstance(e, ValueError) and (
-            "auth" in str(e).lower() or "token" in str(e).lower()
-        ):
-            return JSONResponse(
-                status_code=401,
-                content={"error": {"message": str(e), "type": "authentication_error"}},
-            )
-        return JSONResponse(
-            status_code=500,
-            content={"error": {"message": str(e), "type": "internal_error"}},
-        )
+    # except Exception as e:
+    #     logger.error(f"[Server] Error: {e}")
+    #     # Simple heuristic to return 401 if it's token/auth related string
+    #     if isinstance(e, ValueError) and (
+    #         "auth" in str(e).lower() or "token" in str(e).lower()
+    #     ):
+    #         return JSONResponse(
+    #             status_code=401,
+    #             content={"error": {"message": str(e), "type": "authentication_error"}},
+    #         )
+    #     return JSONResponse(
+    #         status_code=500,
+    #         content={"error": {"message": str(e), "type": "internal_error"}},
+    #     )
 
 
 @app.get("/health")

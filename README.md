@@ -1,10 +1,10 @@
 # DeepSeek AI OpenAI Compatible API
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Flask](https://img.shields.io/badge/Flask-3.0+-green.svg)](https://flask.palletsprojects.com/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-基于 DeepSeek AI (chat.deepseek.com) 的逆向 API，提供 OpenAI 兼容接口。
+基于 DeepSeek AI (chat.deepseek.com) 的逆向 API，提供 OpenAI 兼容接口。采用全链路纯异步架构设计。
 
 ## 🔗 相关项目
 
@@ -25,12 +25,14 @@
 
 ### 环境要求
 - Python 3.8+
+- [uv](https://github.com/astral-sh/uv) (项目依赖管理工具)
 - wasmtime (用于 POW 计算)
 
 ### 安装依赖
 
 ```bash
-pip install -r requirements.txt
+# 使用 uv 极速安装并同步依赖
+uv sync
 ```
 
 ## 🚀 快速开始
@@ -41,7 +43,7 @@ pip install -r requirements.txt
 
 ```bash
 # 单个账号登录
-python -c "from deepseek_ai.account_register import login_account; login_account('your_email@example.com', 'your_password')"
+uv run python -c "from deepseek_ai.account_register import login_account; login_account('your_email@example.com', 'your_password')"
 ```
 
 **方法 B: 从浏览器获取**
@@ -65,7 +67,7 @@ cp .env.example .env
 ### 3. 启动服务
 
 ```bash
-python start_server.py
+uv run server.py
 ```
 
 **启动参数：**
@@ -280,10 +282,10 @@ VLESS_PROXIES=vless://uuid@host:port?security=tls&type=ws&host=host&path=/path#n
 
 ```
 deepseek-ai-reverse-api/
-├── deepseek_ai/              # Python SDK
+├── deepseek/              # Python SDK
 │   ├── __init__.py
-│   ├── adapter.py            # API 适配器
-│   ├── client.py             # OpenAI 兼容客户端
+│   ├── adapter.py            # API 适配器 (httpx.AsyncClient)
+│   ├── client.py             # OpenAI 兼容客户端 (异步)
 │   ├── stream_handler.py     # 流处理
 │   ├── tool_parser.py        # 工具解析
 │   ├── pow_solver.py         # POW 计算 (WASM)
@@ -293,9 +295,10 @@ deepseek-ai-reverse-api/
 │   ├── node_storage.py       # 节点存储
 │   ├── node_tester.py        # 节点测试
 │   └── proxy_adapter.py      # 代理适配器
-├── server.py                 # 主 API 服务器
-├── start_server.py           # 启动脚本
-├── requirements.txt          # 依赖
+├── server.py                 # 主 API 服务器 (FastAPI)
+├── pyproject.toml            # uv 项目配置
+├── uv.lock                   # uv 依赖锁文件
+├── requirements.txt          # 兼容遗留的依赖清单
 ├── .env.example              # 环境变量示例
 ├── .gitignore                # Git 忽略配置
 ├── LICENSE                   # 许可证

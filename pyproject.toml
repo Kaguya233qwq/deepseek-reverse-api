@@ -14,4 +14,4 @@ dependencies = [
 ]
 
 [tool.basedpyright]
-typeCheckingMode = "basic"
+typeCheckingMode = "standard"

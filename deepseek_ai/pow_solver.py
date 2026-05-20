@@ -8,17 +8,11 @@ import struct
 import os
 import logging
 import asyncio
+import wasmtime
 from typing import Optional, TypedDict
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# Ensure wasmtime is available
-try:
-    import wasmtime
-
-    HAS_WASMTIME = True
-except ImportError:
-    HAS_WASMTIME = False
 
 
 class ChallengeDict(TypedDict, total=False):
@@ -182,26 +176,28 @@ _init_lock = asyncio.Lock()
 
 
 def _find_wasm_file() -> str:
-    """Find WASM file robustly."""
+    """Find WASM file robustly using pathlib."""
     global _wasm_path
     if _wasm_path is not None:
         return _wasm_path
 
-    base_dir = os.path.dirname(__file__)
-    possible_paths = [
-        os.path.join(base_dir, "sha3_wasm_bg.7b9ca65ddd.wasm"),
-        os.path.join(base_dir, "..", "sha3_wasm_bg.7b9ca65ddd.wasm"),
+    base_dir = Path(__file__).resolve().parent
+    wasm_name = "sha3_wasm_bg.7b9ca65ddd.wasm"
+
+    possible_paths: list[Path] = [
+        base_dir / wasm_name,
+        base_dir.parent / wasm_name,
     ]
 
-    env_path = os.environ.get("DEEPSEEK_WASM_PATH")
-    if env_path:
-        possible_paths.insert(0, env_path)
+    if env_path := os.environ.get("DEEPSEEK_WASM_PATH"):
+        possible_paths.insert(0, Path(env_path))
 
     for path in possible_paths:
-        if os.path.exists(path):
-            logger.info(f"Discovered WASM payload at: {path}")
-            _wasm_path = path
-            return path
+        if path.is_file():
+            resolved_path = str(path.resolve())
+            logger.info(f"Discovered WASM payload at: {resolved_path}")
+            _wasm_path = resolved_path
+            return resolved_path
 
     logger.error("WASM payload module not found.")
     raise FileNotFoundError(
@@ -214,10 +210,6 @@ def get_deepseek_hash() -> DeepSeekHashWasmtime:
     global _hash_instance
     if _hash_instance is not None:
         return _hash_instance
-
-    if not HAS_WASMTIME:
-        logger.error("wasmtime module is not installed.")
-        raise RuntimeError("wasmtime module is missing. Please install it.")
 
     wasm_path = _find_wasm_file()
 
@@ -239,10 +231,6 @@ async def get_deepseek_hash_async() -> DeepSeekHashWasmtime:
     async with _init_lock:
         if _hash_instance is not None:
             return _hash_instance
-
-        if not HAS_WASMTIME:
-            logger.error("wasmtime module is not installed.")
-            raise RuntimeError("wasmtime module is missing. Please install it.")
 
         wasm_path = _find_wasm_file()
 

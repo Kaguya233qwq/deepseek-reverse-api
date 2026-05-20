@@ -15,6 +15,8 @@ import asyncio
 from typing import Optional, Tuple
 import logging
 
+from httpx import AsyncBaseTransport
+
 logger = logging.getLogger(__name__)
 
 
@@ -110,7 +112,7 @@ class VLessRequestHeader:
         return bytes(header)
 
 
-class VlessTransport:
+class VlessTransport(AsyncBaseTransport):
     """同步 VLess 传输层"""
 
     def __init__(self, uri: str):
@@ -313,9 +315,9 @@ class AsyncVlessTransport:
 
                 # 更新 reader/writer
                 self._reader = asyncio.StreamReader()
-                self._reader.set_transport(ssl_transport)
+                self._reader.set_transport(ssl_transport)  # pyright: ignore[reportArgumentType]
                 self._writer = asyncio.StreamWriter(
-                    ssl_transport, protocol, self._reader, loop
+                    ssl_transport, protocol, self._reader, loop  # pyright: ignore[reportArgumentType]
                 )
                 reader, writer = self._reader, self._writer
 

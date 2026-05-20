@@ -1,8 +1,9 @@
 """DeepSeek Client - OpenAI compatible interface"""
 
-from typing import List, Dict, Optional, Any, Generator, Union
+from typing import List, Dict, Optional
 from .adapter import DeepSeekAdapter
 from .stream_handler import DeepSeekStreamHandler
+from collections.abc import AsyncGenerator
 
 
 class DeepSeekClient:
@@ -16,9 +17,7 @@ class DeepSeekClient:
             use_proxy: Whether to use proxy (Vless or HTTP proxy)
             async_mode: Whether to enable async httpx
         """
-        self.adapter = DeepSeekAdapter(
-            token, use_proxy=use_proxy, async_mode=async_mode
-        )
+        self.adapter = DeepSeekAdapter(token, use_proxy=use_proxy)
         self._session_id: Optional[str] = None
 
     async def chat_completions(
@@ -31,9 +30,8 @@ class DeepSeekClient:
         reasoning_effort: Optional[str] = None,
         thinking_enabled: Optional[bool] = None,
         tools: Optional[List[Dict]] = None,
-        tool_choice: Optional[Any] = None,
         auto_delete_session: bool = False,
-    ) -> Union[Generator[str, None, None], Dict]:
+    ) -> AsyncGenerator[str, None] | dict:
         """Chat completions API
 
         Args:
@@ -84,7 +82,7 @@ class DeepSeekClient:
         response, session_id = await self.adapter.chat_completion_async(  # pyright: ignore[reportGeneralTypeIssues]
             model=model,
             messages=processed_messages,
-            stream=True,  # Always stream from backend
+            stream=stream,
             temperature=temperature,
             web_search=web_search,
             reasoning_effort=reasoning_effort,
@@ -102,7 +100,6 @@ class DeepSeekClient:
         )
 
         if stream:
-
             async def async_generator():
                 async for chunk in handler.handle_stream_async(response):
                     yield chunk
