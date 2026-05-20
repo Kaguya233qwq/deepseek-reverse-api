@@ -475,7 +475,8 @@ class DeepSeekAdapter:
             "preempt": False,
         }
 
-        response = await self.client.post(
+        request = self.client.build_request(
+            "POST",
             url,
             json=payload,
             headers={
@@ -485,11 +486,37 @@ class DeepSeekAdapter:
             },
             timeout=120.0,
         )
+        response = await self.client.send(request, stream=True)
 
         if response.status_code != 200:
             raise ValueError(f"Chat completion failed: HTTP {response.status_code}")
 
         return response, session_id
+
+
+    async def delete_session_async(self, session_id: str) -> bool:
+        """Delete a chat session (async)"""
+        try:
+            token = await self._acquire_token_async()
+            url = f"{self.DEEPSEEK_API_BASE}/v0/chat_session/delete"
+            response = await self.client.post(
+                url,
+                json={"chat_session_id": session_id},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    **self.get_headers(),
+                },
+            )
+
+            data = response.json()
+            success = response.status_code == 200 and data.get("code") == 0
+
+            if success and self._session_id == session_id:
+                self._session_id = None
+
+            return success
+        except Exception:
+            return False
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a chat session (sync)"""
