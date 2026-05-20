@@ -3,10 +3,8 @@
 支持手动登录、自动登录和批量登录
 """
 
-import json
-import time
 import logging
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Callable
 from dataclasses import dataclass
 
 import httpx
@@ -20,6 +18,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 @dataclass
 class RegistrationResult:
     """注册/登录结果"""
+
     success: bool
     email: str
     token: Optional[str] = None
@@ -37,15 +36,9 @@ class DeepSeekAccountRegister:
         Args:
             proxy: 代理地址，如 http://proxy:port
         """
-        self.proxy = proxy
+        self.proxy = {"http://": proxy, "https://": proxy} if proxy else None
         # 使用 httpx.Client 替代 requests.Session
-        self.client = httpx.Client(timeout=30.0)
-
-        if proxy:
-            self.client.proxies = {
-                'http://': proxy,
-                'https://': proxy
-            }
+        self.client = httpx.Client(timeout=30.0, proxy=self.proxy)  # pyright: ignore[reportArgumentType]
 
     def signin(self, email: str, password: str) -> str:
         """
@@ -80,7 +73,7 @@ class DeepSeekAccountRegister:
             "x-client-timezone-offset": "28800",
             "x-client-version": "1.8.0",
             "referrer": "https://chat.deepseek.com/sign_in",
-            "User-Agent": USER_AGENT
+            "User-Agent": USER_AGENT,
         }
 
         data = {
@@ -89,13 +82,11 @@ class DeepSeekAccountRegister:
             "password": password,
             "area_code": "",
             "device_id": "",
-            "os": "web"
+            "os": "web",
         }
 
         response = self.client.post(
-            f"{DEEPSEEK_BASE_URL}/api/v0/users/login",
-            headers=headers,
-            json=data
+            f"{DEEPSEEK_BASE_URL}/api/v0/users/login", headers=headers, json=data
         )
 
         if response.status_code != 200:
@@ -104,7 +95,11 @@ class DeepSeekAccountRegister:
         result = response.json()
 
         if result.get("code") != 0:
-            error_msg = result.get("msg") or result.get("data", {}).get("biz_msg") or "Unknown error"
+            error_msg = (
+                result.get("msg")
+                or result.get("data", {}).get("biz_msg")
+                or "Unknown error"
+            )
             raise Exception(f"登录失败: {error_msg}")
 
         # 提取 Token
@@ -123,10 +118,10 @@ class DeepSeekAccountRegister:
 
 
 def register_account_auto(
-        email: str,
-        password: str,
-        proxy: Optional[str] = None,
-        callback: Optional[Callable] = None
+    email: str,
+    password: str,
+    proxy: Optional[str] = None,
+    callback: Optional[Callable] = None,
 ) -> RegistrationResult:
     """
     自动登录获取 Token
@@ -152,12 +147,7 @@ def register_account_auto(
         if callback:
             callback(f"登录成功: {email}")
 
-        return RegistrationResult(
-            success=True,
-            email=email,
-            token=token,
-            proxy=proxy
-        )
+        return RegistrationResult(success=True, email=email, token=token, proxy=proxy)
 
     except Exception as e:
         logger.error(f"[Register] 登录失败 {email}: {e}")
@@ -165,12 +155,7 @@ def register_account_auto(
         if callback:
             callback(f"登录失败: {email} - {e}")
 
-        return RegistrationResult(
-            success=False,
-            email=email,
-            error=str(e),
-            proxy=proxy
-        )
+        return RegistrationResult(success=False, email=email, error=str(e), proxy=proxy)
     finally:
         if register:
             register.close()

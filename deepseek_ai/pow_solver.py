@@ -7,7 +7,7 @@ import base64
 import struct
 import os
 import logging
-import threading
+import asyncio
 from typing import Optional, TypedDict
 
 logger = logging.getLogger(__name__)
@@ -178,7 +178,7 @@ class DeepSeekHashWasmtime:
 # Global instance
 _hash_instance = None
 _wasm_path: Optional[str] = None
-_init_lock = threading.Lock()
+_init_lock = asyncio.Lock()
 
 
 def _find_wasm_file() -> str:
@@ -210,12 +210,33 @@ def _find_wasm_file() -> str:
 
 
 def get_deepseek_hash() -> DeepSeekHashWasmtime:
-    """Get DeepSeekHash singleton instance (Thread-safe)"""
+    """Get DeepSeekHash singleton instance (Sync path - assumes pre-initialized or safe to block briefly)"""
     global _hash_instance
     if _hash_instance is not None:
         return _hash_instance
 
-    with _init_lock:
+    if not HAS_WASMTIME:
+        logger.error("wasmtime module is not installed.")
+        raise RuntimeError("wasmtime module is missing. Please install it.")
+
+    wasm_path = _find_wasm_file()
+
+    try:
+        _hash_instance = DeepSeekHashWasmtime(wasm_path)
+        logger.info("Initialized POW solver via Wasmtime runtime.")
+        return _hash_instance
+    except Exception as e:
+        logger.error(f"Wasmtime init failed: {e}")
+        raise RuntimeError(f"Failed to initialize Wasmtime runtime: {e}")
+
+
+async def get_deepseek_hash_async() -> DeepSeekHashWasmtime:
+    """Get DeepSeekHash singleton instance (Async safe)"""
+    global _hash_instance
+    if _hash_instance is not None:
+        return _hash_instance
+
+    async with _init_lock:
         if _hash_instance is not None:
             return _hash_instance
 

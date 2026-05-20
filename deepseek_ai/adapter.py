@@ -2,7 +2,6 @@
 
 import uuid
 import time
-import threading
 from typing import Dict, Optional, Tuple, Union, List
 import re
 
@@ -14,14 +13,19 @@ from .pow_solver import calculate_challenge_answer
 
 class DeepSeekAPIError(Exception):
     """DeepSeek API 基础异常"""
+
     pass
+
 
 class DeepSeekAuthError(DeepSeekAPIError):
     """认证相关错误（Token无效/过期）"""
+
     pass
+
 
 class DeepSeekRequestError(DeepSeekAPIError):
     """请求错误"""
+
     pass
 
 
@@ -54,12 +58,12 @@ class DeepSeekAdapter:
         "deepseek-v4-flash": "deepseek-chat",
         "deepseek-v4-pro": "deepseek-reasoner",
     }
-    
+
     # 可配置的超时/过期时间
     TOKEN_EXPIRY_SECONDS = 3600  # 1小时
     SESSION_EXPIRY_SECONDS = 300  # 5分钟
 
-    def __init__(self, token: str, use_proxy: bool = True, async_mode: bool = False):
+    def __init__(self, token: str, use_proxy: bool = True):
         """Initialize DeepSeek Adapter
 
         Args:
@@ -73,11 +77,9 @@ class DeepSeekAdapter:
         self._session_id: Optional[str] = None
         self._session_created_at: int = 0
         self.use_proxy = use_proxy
-        self.async_mode = async_mode
-        
-        # 线程锁，保护共享状态
-        self._sync_lock = threading.Lock()
-        self._async_lock = None  # 在异步方法中动态创建 asyncio.Lock
+
+        # 异步锁，保护共享状态
+        self._async_lock = None  # 会在首次异步调用中延迟初始化，或由框架保证事件循环
 
         # Initialize proxy manager if needed
         if use_proxy:
@@ -89,15 +91,11 @@ class DeepSeekAdapter:
                 self.proxy_manager = init_proxy_manager()
                 self.proxy_manager._initialized = True
             # Create httpx client via proxy manager
-            self.client = self.proxy_manager.create_client(
-                use_vless=True, async_mode=async_mode
-            )
+            self.client = self.proxy_manager.create_client(use_vless=True)
         else:
             # Direct client without proxy
-            if async_mode:
-                self.client = httpx.AsyncClient(timeout=120.0)
-            else:
-                self.client = httpx.Client(timeout=120.0)
+
+            self.client = httpx.AsyncClient(timeout=120.0)
 
     def _uuid(self) -> str:
         """Generate UUID"""
@@ -123,25 +121,35 @@ class DeepSeekAdapter:
         return base_model
 
     # --- Sync methods ---
-    def _acquire_token_sync(self) -> str:
+    async def _acquire_token_async(self) -> str:
         """Acquire access token from DeepSeek (sync, thread-safe)"""
         if not self.token:
             raise DeepSeekAuthError("DeepSeek token not configured")
 
-        with self._sync_lock:
+        if self._async_lock is None:
+            import asyncio
+
+            self._async_lock = asyncio.Lock()
+
+        async with self._async_lock:
             if self._access_token and self._token_expires_at > int(time.time()):
                 return self._access_token
 
             url = f"{self.DEEPSEEK_API_BASE}/v0/users/current"
-            response = self.client.get(
-                url, headers={"Authorization": f"Bearer {self.token}", **self.get_headers()}
+            response = await self.client.get(
+                url,
+                headers={"Authorization": f"Bearer {self.token}", **self.get_headers()},
             )
 
             if response.status_code in [401, 403]:
-                raise DeepSeekAuthError("Token invalid or expired, please get a new token")
+                raise DeepSeekAuthError(
+                    "Token invalid or expired, please get a new token"
+                )
 
             if response.status_code != 200:
-                raise DeepSeekRequestError(f"Failed to acquire token: HTTP {response.status_code}")
+                raise DeepSeekRequestError(
+                    f"Failed to acquire token: HTTP {response.status_code}"
+                )
 
             data = response.json()
             biz_data = data.get("data", {}).get("biz_data") or data.get("biz_data")
@@ -159,16 +167,25 @@ class DeepSeekAdapter:
 
             return self._access_token
 
-    def _create_session_sync(self) -> str:
+    async def _create_session_async(self) -> str:
         """Create a new chat session (sync, thread-safe)"""
-        with self._sync_lock:
-            if self._session_id and (time.time() - self._session_created_at) < self.SESSION_EXPIRY_SECONDS:
+        if self._async_lock is None:
+            import asyncio
+
+            self._async_lock = asyncio.Lock()
+
+        async with self._async_lock:
+            if (
+                self._session_id
+                and (time.time() - self._session_created_at)
+                < self.SESSION_EXPIRY_SECONDS
+            ):
                 return self._session_id
 
-        token = self._acquire_token_sync()
+        token = await self._acquire_token_async()
 
         url = f"{self.DEEPSEEK_API_BASE}/v0/chat_session/create"
-        response = self.client.post(
+        response = await self.client.post(
             url,
             json={"character_id": None},
             headers={
@@ -191,19 +208,21 @@ class DeepSeekAdapter:
             session_id = biz_data.get("id")
 
         if not session_id:
-            raise DeepSeekRequestError("Failed to create session: no session id in response")
+            raise DeepSeekRequestError(
+                "Failed to create session: no session id in response"
+            )
 
-        with self._sync_lock:
+        async with self._async_lock:
             self._session_id = session_id
             self._session_created_at = time.time()
 
         return self._session_id
 
-    def _get_challenge_sync(self, target_path: str) -> Dict:
+    async def _get_challenge_async(self, target_path: str) -> Dict:
         """Get POW challenge from DeepSeek (sync)"""
-        token = self._acquire_token_sync()
+        token = await self._acquire_token_async()
         url = f"{self.DEEPSEEK_API_BASE}/v0/chat/create_pow_challenge"
-        response = self.client.post(
+        response = await self.client.post(
             url,
             json={"target_path": target_path},
             headers={
@@ -283,23 +302,21 @@ class DeepSeekAdapter:
                 result.append(f"<｜Assistant｜>{safe_text}<｜end of sentence｜>")
             elif block["role"] in ["user", "system"]:
                 safe_text = block["text"].replace("<｜", "&lt;｜")
-                result.append(
-                    f"<｜User｜>{safe_text}" if index > 0 else safe_text
-                )
+                result.append(f"<｜User｜>{safe_text}" if index > 0 else safe_text)
             elif block["role"] == "tool":
                 safe_text = block["text"].replace("<｜", "&lt;｜")
                 result.append(f"<｜User｜>{safe_text}")
 
         prompt = "".join(result)
-        
+
         # 移除 Markdown 图片，但避免误删其他内容
-        prompt = re.sub(r'!\[.*?\]\(.*?\)', '', prompt)
+        prompt = re.sub(r"!\[.*?\]\(.*?\)", "", prompt)
         # 移除可能残留的 HTML 标签
-        prompt = re.sub(r'<[^>]+>', '', prompt)
+        prompt = re.sub(r"<[^>]+>", "", prompt)
 
         return prompt
 
-    def chat_completion(
+    async def chat_completion_async(
         self,
         model: str,
         messages: list,
@@ -310,10 +327,10 @@ class DeepSeekAdapter:
         thinking_enabled: Optional[bool] = None,
     ) -> Union[httpx.Response, Tuple[httpx.Response, str]]:
         """Send chat completion request (sync)"""
-        token = self._acquire_token_sync()
-        session_id = self._create_session_sync()
+        token = await self._acquire_token_async()
+        session_id = await self._create_session_async()
 
-        challenge = self._get_challenge_sync("/api/v0/chat/completion")
+        challenge = await self._get_challenge_async("/api/v0/chat/completion")
         challenge_answer = self._calculate_challenge_answer(challenge)
 
         prompt = self._messages_to_prompt(messages)
@@ -345,13 +362,15 @@ class DeepSeekAdapter:
 
         url = f"{self.DEEPSEEK_API_BASE}/v0/chat/completion"
 
-        response = self.client.post(url, json=payload, headers=headers)
+        response = await self.client.post(url, json=payload, headers=headers)
 
         if response.status_code != 200:
             # 尝试解析错误信息
             try:
                 error_data = response.json()
-                error_msg = error_data.get("msg") or error_data.get("error") or "Unknown error"
+                error_msg = (
+                    error_data.get("msg") or error_data.get("error") or "Unknown error"
+                )
             except Exception:
                 error_msg = f"HTTP {response.status_code}"
             raise DeepSeekRequestError(f"Chat completion failed: {error_msg}")
@@ -363,7 +382,28 @@ class DeepSeekAdapter:
             # 对于非流式响应，也返回 response 对象，调用方可直接 .json()
             return response
 
-    def close(self):
+    async def close(self):
         """关闭 HTTP 客户端"""
-        if hasattr(self, 'client') and self.client:
-            self.client.close()
+        if hasattr(self, "client") and self.client:
+            await self.client.aclose()
+
+    async def delete_session_async(self, session_id: str) -> bool:
+        """Delete a chat session (async)"""
+        try:
+            token = await self._acquire_token_async()
+            url = f"{self.DEEPSEEK_API_BASE}/v0/chat_session/delete"
+            response = await self.client.post(
+                url,
+                json={"chat_session_id": session_id},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    **self.get_headers(),
+                },
+            )
+            data = response.json()
+            success = response.status_code == 200 and data.get("code") == 0
+            if success and self._session_id == session_id:
+                self._session_id = None
+            return success
+        except Exception:
+            return False

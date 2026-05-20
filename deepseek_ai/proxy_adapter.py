@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any
 import httpx
 
 from .vless_proxy import VlessProxyPool, get_proxy_pool, init_proxy_pool_from_env
-from .vless_transport import VlessTransport, AsyncVlessTransport
+from .vless_transport import VlessTransport
 
 
 class ProxyManager:
@@ -59,7 +59,7 @@ class ProxyManager:
 
     def create_client(
         self, use_vless: bool = True, async_mode: bool = False, timeout: float = 30.0
-    ) -> httpx.Client:
+    ) -> httpx.AsyncClient:
         """
         创建配置了代理的 httpx Client
 
@@ -76,21 +76,15 @@ class ProxyManager:
 
         if use_vless and self.vless_pool and self.vless_pool.count > 0:
             # 使用 VLess 代理
-            if async_mode:
-                transport = AsyncVlessTransport(proxy_pool=self.vless_pool)
-                return httpx.AsyncClient(transport=transport, timeout=timeout)
-            else:
-                transport = VlessTransport(proxy_pool=self.vless_pool)
-                return httpx.Client(transport=transport, timeout=timeout)
+
+            transport = VlessTransport(proxy_pool=self.vless_pool)
+            return httpx.AsyncClient(transport=transport, timeout=timeout)
         else:
             # 使用普通 HTTP 代理
             proxies = self.get_requests_proxies()
-            if async_mode:
-                return httpx.AsyncClient(proxy=proxies, timeout=timeout)
-            else:
-                return httpx.Client(proxy=proxies, timeout=timeout)
+            return httpx.AsyncClient(proxy=proxies, timeout=timeout)  # pyright: ignore[reportArgumentType]
 
-    def create_session(self, use_vless: bool = True) -> httpx.Client:
+    def create_session(self, use_vless: bool = True) -> httpx.AsyncClient:
         """
         创建配置了代理的 Session（兼容旧接口，返回同步 Client）
 

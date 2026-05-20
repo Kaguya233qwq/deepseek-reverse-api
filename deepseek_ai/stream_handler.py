@@ -4,7 +4,7 @@ Converts DeepSeek SSE stream to OpenAI compatible format
 
 import json
 import re
-from typing import Dict, Any, Optional, Callable, Generator
+from typing import Dict, Any, Optional, Callable, Generator, AsyncGenerator
 from .tool_parser import ToolParser
 
 
@@ -48,7 +48,7 @@ class DeepSeekStreamHandler:
             'created': self.created,
         })
     
-    def handle_stream(self, response) -> Generator[str, None, None]:
+    async def handle_stream_async(self, response) -> AsyncGenerator[str, None]:
         """Handle streaming response"""
         is_thinking_model = (
             'think' in self.model.lower() or 
@@ -65,7 +65,7 @@ class DeepSeekStreamHandler:
         
         buffer = ''
         
-        for line in response.iter_lines():
+        async for line in response.aiter_lines():
             if not line:
                 continue
             
@@ -298,7 +298,7 @@ class DeepSeekStreamHandler:
         else:
             return self._create_chunk({}, finish_reason)
     
-    def handle_non_stream(self, response) -> Dict:
+    async def handle_non_stream_async(self, response) -> Dict:
         """Handle non-streaming response"""
         accumulated_content = ''
         accumulated_thinking = ''
@@ -319,7 +319,7 @@ class DeepSeekStreamHandler:
         
         buffer = ''
         
-        for line in response.iter_lines():
+        async for line in response.aiter_lines():
             if not line:
                 continue
             

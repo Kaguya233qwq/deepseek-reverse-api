@@ -8,17 +8,20 @@ from .stream_handler import DeepSeekStreamHandler
 class DeepSeekClient:
     """DeepSeek Client with OpenAI compatible interface"""
 
-    def __init__(self, token: str, use_proxy: bool = True):
+    def __init__(self, token: str, use_proxy: bool = True, async_mode: bool = True):
         """Initialize DeepSeek Client
 
         Args:
             token: DeepSeek token from login response
             use_proxy: Whether to use proxy (Vless or HTTP proxy)
+            async_mode: Whether to enable async httpx
         """
-        self.adapter = DeepSeekAdapter(token, use_proxy=use_proxy)
+        self.adapter = DeepSeekAdapter(
+            token, use_proxy=use_proxy, async_mode=async_mode
+        )
         self._session_id: Optional[str] = None
 
-    def chat_completions(
+    async def chat_completions(
         self,
         model: str,
         messages: List[Dict],
@@ -78,7 +81,7 @@ class DeepSeekClient:
                         0, {"role": "system", "content": tool_prompt}
                     )
 
-        response, session_id = self.adapter.chat_completion(  # pyright: ignore[reportGeneralTypeIssues]
+        response, session_id = await self.adapter.chat_completion_async(  # pyright: ignore[reportGeneralTypeIssues]
             model=model,
             messages=processed_messages,
             stream=True,  # Always stream from backend
@@ -93,27 +96,31 @@ class DeepSeekClient:
         handler = DeepSeekStreamHandler(
             model,
             session_id,
-            on_end=lambda: self._on_stream_end(auto_delete_session),
+            on_end=None,  # auto_delete_session will be handled after stream
             web_search_enabled=web_search,
             reasoning_effort=reasoning_effort,
         )
 
         if stream:
-            return handler.handle_stream(response)
-        else:
-            return handler.handle_non_stream(response)
 
-    def _on_stream_end(self, auto_delete_session: bool):
+            async def async_generator():
+                async for chunk in handler.handle_stream_async(response):
+                    yield chunk
+                await self._on_stream_end_async(auto_delete_session)
+
+            return async_generator()
+        else:
+            return await handler.handle_non_stream_async(response)
+
+    async def _on_stream_end_async(self, auto_delete_session: bool):
         """Handle stream end callback"""
         if auto_delete_session and self._session_id:
-            import threading
+            import asyncio
 
-            threading.Thread(
-                target=self.delete_session, args=(self._session_id,)
-            ).start()
+            asyncio.create_task(self.delete_session_async(self._session_id))
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a session
+    async def delete_session_async(self, session_id: str) -> bool:
+        """Delete a session (async)
 
         Args:
             session_id: Session ID
@@ -121,4 +128,4 @@ class DeepSeekClient:
         Returns:
             bool: True if deletion was successful
         """
-        return self.adapter.delete_session(session_id)
+        return await self.adapter.delete_session_async(session_id)

@@ -9,11 +9,11 @@ import json
 import time
 import logging
 
-from flask import Flask, request, Response, jsonify
-from flask_cors import CORS
-from werkzeug.exceptions import Unauthorized, BadRequest
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 from dotenv import load_dotenv
-from asgiref.wsgi import WsgiToAsgi
 
 # 加载环境变量
 load_dotenv()
@@ -31,10 +31,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask app
-app = Flask(__name__)
-asgi_app = WsgiToAsgi(app)
-CORS(app)
+# FastAPI app
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Global settings from environment
 AUTO_DELETE_SESSION = os.environ.get("AUTO_DELETE_SESSION", "false").lower() == "true"
@@ -98,8 +104,15 @@ def get_auth_token() -> str:
     """Get authorization token from env"""
     auth_header = os.environ.get("DEEPSEEK_TOKENS")
     if not auth_header:
-        raise Unauthorized("No AUTH_TOKEN provided in environment variables")
-
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "message": "No AUTH_TOKEN provided in environment variables",
+                    "type": "authentication_error",
+                }
+            },
+        )
     return auth_header
 
 
@@ -113,8 +126,8 @@ def select_random_token(token_string: str) -> str:
     return random.choice(tokens)
 
 
-@app.route("/v1/models", methods=["GET"])
-def list_models():
+@app.get("/v1/models")
+async def list_models():
     """List available models"""
     models = [
         {
@@ -125,11 +138,11 @@ def list_models():
         }
         for model_id in SUPPORTED_MODELS
     ]
-    return jsonify({"object": "list", "data": models})
+    return {"object": "list", "data": models}
 
 
-@app.route("/v1/chat/completions", methods=["POST"])
-def chat_completions():
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
     """Chat completions endpoint - users provide their own tokens"""
     try:
         # Get token
@@ -137,9 +150,29 @@ def chat_completions():
         token = select_random_token(token_string)
 
         # Parse request
-        data = request.get_json()
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": "Invalid JSON body",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
         if not data:
-            raise BadRequest("Invalid JSON body")
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": "Empty JSON body",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
 
         model = data.get("model", "deepseek-chat")
         messages = data.get("messages", [])
@@ -182,9 +215,9 @@ def chat_completions():
 
         if stream:
             # Streaming response
-            def generate():
+            async def generate():
                 try:
-                    result = client.chat_completions(
+                    result = await client.chat_completions(
                         model=model,
                         messages=messages,
                         stream=True,
@@ -197,7 +230,7 @@ def chat_completions():
                         auto_delete_session=AUTO_DELETE_SESSION,
                     )
 
-                    for chunk in result:
+                    async for chunk in result:
                         yield chunk
 
                 except Exception as e:
@@ -208,10 +241,10 @@ def chat_completions():
                     yield f"data: {error_chunk}\n\n"
                     yield "data: [DONE]\n\n"
 
-            return Response(generate(), mimetype="text/event-stream")
+            return StreamingResponse(generate(), media_type="text/event-stream")
         else:
             # Non-streaming response
-            result = client.chat_completions(
+            result = await client.chat_completions(
                 model=model,
                 messages=messages,
                 stream=False,
@@ -224,102 +257,124 @@ def chat_completions():
                 auto_delete_session=AUTO_DELETE_SESSION,
             )
 
-            return jsonify(result)
+            return result
 
-    except Unauthorized as e:
-        return jsonify(
-            {"error": {"message": str(e), "type": "authentication_error"}}
-        ), 401
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[Server] Error: {e}")
-        return jsonify({"error": {"message": str(e), "type": "internal_error"}}), 500
+        # Simple heuristic to return 401 if it's token/auth related string
+        if isinstance(e, ValueError) and (
+            "auth" in str(e).lower() or "token" in str(e).lower()
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"message": str(e), "type": "authentication_error"}},
+            )
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e), "type": "internal_error"}},
+        )
 
 
-@app.route("/health", methods=["GET"])
-def health_check():
+@app.get("/health")
+async def health_check():
     """Health check endpoint"""
-    return jsonify(
-        {"status": "healthy", "service": "deepseek-ai-openai-api", "version": "1.0.0"}
-    )
+    return {
+        "status": "healthy",
+        "service": "deepseek-ai-openai-api",
+        "version": "1.0.0",
+    }
 
 
-@app.route("/v1/proxy/stats", methods=["GET"])
-def proxy_stats():
+@app.get("/v1/proxy/stats")
+async def proxy_stats():
     """Get proxy statistics"""
     global proxy_manager
 
     if proxy_manager is None:
-        return jsonify({"enabled": False, "message": "Proxy manager not initialized"})
+        return {"enabled": False, "message": "Proxy manager not initialized"}
 
     try:
         stats = proxy_manager.get_stats()
-        return jsonify({"enabled": True, "stats": stats})
+        return {"enabled": True, "stats": stats}
     except Exception as e:
-        return jsonify({"error": {"message": str(e), "type": "internal_error"}}), 500
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e), "type": "internal_error"}},
+        )
 
 
-@app.route("/v1/nodes/test", methods=["POST"])
-def test_nodes():
+@app.post("/v1/nodes/test")
+async def test_nodes():
     """Test all nodes"""
     global node_tester, node_storage
 
     if node_tester is None or node_storage is None:
-        return jsonify(
-            {"success": False, "message": "Node tester or storage not initialized"}
-        ), 503
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "message": "Node tester or storage not initialized",
+            },
+        )
 
     try:
         results = node_tester.test_all_nodes()
-        return jsonify({"success": True, "results": results})
+        return {"success": True, "results": results}
     except Exception as e:
-        return jsonify({"error": {"message": str(e), "type": "internal_error"}}), 500
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e), "type": "internal_error"}},
+        )
 
 
-@app.route("/v1/nodes/stats", methods=["GET"])
-def nodes_stats():
+@app.get("/v1/nodes/stats")
+async def nodes_stats():
     """Get nodes statistics"""
     global node_storage
 
     if node_storage is None:
-        return jsonify({"enabled": False, "message": "Node storage not initialized"})
+        return {"enabled": False, "message": "Node storage not initialized"}
 
     try:
         stats = node_storage.get_stats()
-        return jsonify({"enabled": True, "stats": stats})
+        return {"enabled": True, "stats": stats}
     except Exception as e:
-        return jsonify({"error": {"message": str(e), "type": "internal_error"}}), 500
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e), "type": "internal_error"}},
+        )
 
 
-@app.route("/")
-def root():
+@app.get("/")
+async def root():
     """Root endpoint"""
-    return jsonify(
-        {
-            "service": "DeepSeek AI OpenAI Compatible API",
-            "version": "1.0.0",
-            "description": "Users provide their own tokens for API access",
-            "features": [
-                "openai_compatible_api",
-                "streaming_support",
-                "proxy_support",
-                "web_search",
-                "reasoning_mode",
-                "tool_calls",
-            ],
-            "endpoints": {
-                "chat_completions": "/v1/chat/completions",
-                "models": "/v1/models",
-                "health": "/health",
-                "proxy_stats": "/v1/proxy/stats",
-                "nodes_test": "/v1/nodes/test",
-                "nodes_stats": "/v1/nodes/stats",
-            },
-            "account_pool": {
-                "description": "For account pool functionality, see /pool/ subdirectory",
-                "endpoint": "/pool/",
-            },
-        }
-    )
+    return {
+        "service": "DeepSeek AI OpenAI Compatible API",
+        "version": "1.0.0",
+        "description": "Users provide their own tokens for API access",
+        "features": [
+            "openai_compatible_api",
+            "streaming_support",
+            "proxy_support",
+            "web_search",
+            "reasoning_mode",
+            "tool_calls",
+        ],
+        "endpoints": {
+            "chat_completions": "/v1/chat/completions",
+            "models": "/v1/models",
+            "health": "/health",
+            "proxy_stats": "/v1/proxy/stats",
+            "nodes_test": "/v1/nodes/test",
+            "nodes_stats": "/v1/nodes/stats",
+        },
+        "account_pool": {
+            "description": "For account pool functionality, see /pool/ subdirectory",
+            "endpoint": "/pool/",
+        },
+    }
 
 
 if __name__ == "__main__":
@@ -327,7 +382,6 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8000))
     host = os.environ.get("HOST", "0.0.0.0")
-    debug = os.environ.get("DEBUG", "false").lower() == "true"
 
-    logger.info(f"Starting DeepSeek AI OpenAI API Server on {host}:{port}")
-    app.run(host=host, port=port, debug=debug, threaded=True)
+    logger.info(f"Starting DeepSeek AI OpenAI API Server (FastAPI) on {host}:{port}")
+    uvicorn.run(app, host=host, port=port)
